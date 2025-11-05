@@ -381,61 +381,136 @@ class USENIXSecurityCrawler:
         
         logger.info(f"元数据已保存为: {', '.join(formats)} 格式")
     
-    def download_paper(self, paper_info, save_path, session=None):
+    def download_paper(self, paper_info, save_path, session=None, max_retries=3):
         """
-        下载单篇论文
+        下载单篇论文（带重试机制）
         
         Args:
             paper_info: 论文信息字典
             save_path: 保存路径
             session: requests Session对象，如果为None则使用self.session
+            max_retries: 最大重试次数
             
         Returns:
             是否下载成功
         """
         # 下载前再次检查文件是否存在（防止并发时重复下载）
-        if save_path.exists():
+        if save_path.exists() and save_path.stat().st_size > 1000:
             return True
         
-        try:
-            # 使用传入的session或创建新的
-            if session is None:
-                session = self.session
-            
-            response = session.get(paper_info['pdf_url'], timeout=30, stream=True)
-            response.raise_for_status()
-            
-            # 检查是否为PDF
-            content_type = response.headers.get('Content-Type', '')
-            if 'pdf' not in content_type.lower():
-                # 检查内容
-                content = response.content[:4]
-                if content != b'%PDF':
-                    logger.warning(f"文件可能不是PDF: {paper_info['pdf_url']}")
-            
-            # 保存文件（使用临时文件名，避免并发冲突）
+        # 使用传入的session或创建新的
+        if session is None:
+            session = self.session
+        
+        pdf_url = paper_info['pdf_url']
+        
+        # 重试循环
+        for attempt in range(max_retries):
             temp_path = save_path.with_suffix('.tmp')
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
             
-            # 验证文件大小
-            if temp_path.stat().st_size < 1000:  # 小于1KB可能是错误页面
-                logger.warning(f"下载的文件过小，可能下载失败: {save_path}")
-                temp_path.unlink()
+            try:
+                # 指数退避：第1次立即，第2次等1秒，第3次等2秒
+                if attempt > 0:
+                    wait_time = min(2 ** (attempt - 1), 5)  # 最多等待5秒
+                    logger.info(f"重试下载 (第{attempt + 1}/{max_retries}次): {pdf_url[:80]}...")
+                    time.sleep(wait_time)
+                
+                # 设置更长的超时时间，并允许重定向
+                response = session.get(
+                    pdf_url, 
+                    timeout=(10, 60),  # (连接超时, 读取超时)
+                    stream=True,
+                    allow_redirects=True
+                )
+                response.raise_for_status()
+                
+                # 验证Content-Type
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'pdf' not in content_type and 'octet-stream' not in content_type:
+                    # 读取前几个字节验证
+                    content_preview = next(response.iter_content(chunk_size=1024), None)
+                    if not content_preview or content_preview[:4] != b'%PDF':
+                        # 检查是否是HTML错误页面
+                        if content_preview:
+                            preview_str = content_preview[:200].decode('utf-8', errors='ignore').lower()
+                            if '<html' in preview_str or '<!doctype' in preview_str:
+                                logger.warning(f"下载的不是PDF文件（HTML响应）: {pdf_url}")
+                                if attempt < max_retries - 1:
+                                    continue
+                                return False
+                        logger.warning(f"文件可能不是PDF: {pdf_url}")
+                
+                # 保存文件（使用临时文件名，避免并发冲突）
+                with open(temp_path, 'wb') as f:
+                    # 如果已经读取了预览内容，先写入
+                    if 'content_preview' in locals() and content_preview:
+                        f.write(content_preview)
+                        # 继续下载剩余内容
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    else:
+                        # 直接下载
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                
+                # 验证文件大小和内容
+                file_size = temp_path.stat().st_size
+                if file_size < 1000:  # 小于1KB可能是错误页面
+                    logger.warning(f"下载的文件过小 ({file_size} bytes): {save_path}")
+                    temp_path.unlink()
+                    if attempt < max_retries - 1:
+                        continue
+                    return False
+                
+                # 再次验证文件开头是否为PDF
+                with open(temp_path, 'rb') as f:
+                    file_start = f.read(4)
+                    if file_start != b'%PDF':
+                        logger.error(f"保存的文件不是有效的PDF: {save_path}")
+                        temp_path.unlink()
+                        if attempt < max_retries - 1:
+                            continue
+                        return False
+                
+                # 原子性重命名
+                temp_path.replace(save_path)
+                return True
+                
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, 
+                    requests.exceptions.ChunkedEncodingError) as e:
+                # 网络相关错误，可以重试
+                error_type = type(e).__name__
+                if attempt < max_retries - 1:
+                    logger.warning(f"下载失败 ({error_type}): {pdf_url[:80]}...，将重试")
+                    # 清理临时文件
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    continue
+                else:
+                    logger.error(f"下载论文失败（已重试{max_retries}次） {pdf_url}: {e}")
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    return False
+                    
+            except requests.exceptions.HTTPError as e:
+                # HTTP错误（如404, 403），通常不应该重试
+                logger.error(f"HTTP错误 {e.response.status_code}: {pdf_url}")
+                if temp_path.exists():
+                    temp_path.unlink()
                 return False
-            
-            # 原子性重命名
-            temp_path.replace(save_path)
-            return True
-            
-        except Exception as e:
-            logger.error(f"下载论文失败 {paper_info['pdf_url']}: {e}")
-            # 清理临时文件
-            if 'temp_path' in locals() and temp_path.exists():
-                temp_path.unlink()
-            return False
+                
+            except Exception as e:
+                # 其他错误
+                logger.error(f"下载论文失败 {pdf_url}: {e}")
+                if temp_path.exists():
+                    temp_path.unlink()
+                if attempt < max_retries - 1:
+                    continue
+                return False
+        
+        return False
     
     def _download_worker(self, paper_info, save_path, index, total):
         """

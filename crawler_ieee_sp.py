@@ -498,28 +498,106 @@ class IEEESPCrawler:
             if session is None:
                 session = self.session
             
-            response = session.get(paper_info['pdf_url'], timeout=30, stream=True)
+            # 获取article number并构造真实的PDF下载URL
+            pdf_url = None
+            document_link = paper_info.get('document_link', '')
+            article_number = None
+            
+            # 从document_link或pdf_url中提取article number
+            if document_link:
+                doc_match = re.search(r'/document/(\d+)', document_link)
+                if doc_match:
+                    article_number = doc_match.group(1)
+            elif paper_info.get('pdf_url'):
+                doc_match = re.search(r'/document/(\d+)', paper_info['pdf_url'])
+                if doc_match:
+                    article_number = doc_match.group(1)
+            
+            # 使用真实的PDF下载端点：stampPDF/getPDF.jsp
+            if article_number:
+                # 这是IEEE Xplore的真实PDF下载端点（从stamp.jsp的iframe中发现）
+                pdf_url = f"{self.BASE_URL}/stampPDF/getPDF.jsp?tp=&arnumber={article_number}&ref="
+            else:
+                # 如果无法提取article number，尝试从详情页获取
+                if document_link:
+                    try:
+                        time.sleep(self.delay)
+                        doc_response = session.get(document_link, timeout=10)
+                        if doc_response.status_code == 200:
+                            doc_soup = BeautifulSoup(doc_response.text, 'html.parser')
+                            
+                            # 从详情页提取article number
+                            doc_match = re.search(r'/document/(\d+)', document_link)
+                            if doc_match:
+                                article_number = doc_match.group(1)
+                                pdf_url = f"{self.BASE_URL}/stampPDF/getPDF.jsp?tp=&arnumber={article_number}&ref="
+                            
+                            # 或者查找iframe中的getPDF.jsp链接
+                            if not pdf_url:
+                                iframe = doc_soup.find('iframe', src=re.compile(r'getPDF\.jsp', re.I))
+                                if iframe:
+                                    iframe_src = iframe.get('src', '')
+                                    if not iframe_src.startswith('http'):
+                                        pdf_url = urljoin(self.BASE_URL, iframe_src)
+                                    else:
+                                        pdf_url = iframe_src
+                    except Exception as e:
+                        logger.debug(f"访问详情页失败: {e}")
+            
+            # 如果还是没有PDF URL，使用原来的逻辑作为备选
+            if not pdf_url:
+                pdf_url = paper_info.get('pdf_url', '')
+            
+            if not pdf_url:
+                logger.error(f"无法获取PDF URL: {paper_info.get('title', 'Unknown')}")
+                return False
+            
+            # 下载PDF
+            response = session.get(pdf_url, timeout=30, stream=True, allow_redirects=True)
             response.raise_for_status()
             
-            # 检查是否为PDF
-            content_type = response.headers.get('Content-Type', '')
-            if 'pdf' not in content_type.lower():
-                content = response.content[:4]
-                if content != b'%PDF':
-                    logger.warning(f"文件可能不是PDF: {paper_info['pdf_url']}")
+            # 先读取前1024字节验证是否为PDF（不写入文件）
+            content_preview = b''
+            chunk_iterator = response.iter_content(chunk_size=1024)
+            for chunk in chunk_iterator:
+                if chunk:
+                    content_preview = chunk[:1024]
+                    break
             
-            # 保存文件
+            # 检查文件开头是否为PDF
+            if len(content_preview) < 4 or content_preview[:4] != b'%PDF':
+                # 检查是否是HTML错误页面
+                content_str = content_preview[:200].decode('utf-8', errors='ignore').lower()
+                if '<html' in content_str or '<!doctype' in content_str or '403' in content_str or 'forbidden' in content_str:
+                    logger.error(f"下载的不是PDF文件（可能是HTML错误页面）: {pdf_url}")
+                    return False
+                logger.warning(f"文件可能不是PDF: {pdf_url}")
+            
+            # 重新下载完整文件（因为已经读取了第一个chunk）
+            response = session.get(pdf_url, timeout=30, stream=True, allow_redirects=True)
+            response.raise_for_status()
+            
+            # 保存完整文件
             temp_path = save_path.with_suffix('.tmp')
             with open(temp_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
             
-            # 验证文件大小
-            if temp_path.stat().st_size < 1000:
+            # 验证文件：必须是PDF且大小合理
+            file_size = temp_path.stat().st_size
+            if file_size < 1000:
                 logger.warning(f"下载的文件过小: {save_path}")
                 temp_path.unlink()
                 return False
+            
+            # 再次验证文件开头是否为PDF
+            with open(temp_path, 'rb') as f:
+                file_start = f.read(4)
+                if file_start != b'%PDF':
+                    logger.error(f"保存的文件不是有效的PDF: {save_path}")
+                    temp_path.unlink()
+                    return False
             
             temp_path.replace(save_path)
             return True
