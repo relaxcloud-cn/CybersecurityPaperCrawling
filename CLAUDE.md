@@ -8,93 +8,103 @@ Automated crawler suite for downloading research papers from top cybersecurity c
 - **USENIX Security** - Free downloads
 - **NDSS** - Free downloads
 - **IEEE S&P** - Open access after 1-year embargo (2023 and earlier should be free)
-- **ACM CCS** - Not yet implemented (will be fully open access from January 2026)
+- **ACM CCS** - Uses FlareSolverr to bypass Cloudflare protection (will be fully open access from January 2026)
 
-## Open Access Policy Notes
+## Project Structure
 
-### IEEE S&P
-According to [IEEE S&P CFP](https://sp2025.ieee-security.org/cfpapers.html):
-- Papers are published open access immediately upon acceptance
-- After the symposium, papers go behind a paywall for **1 year**
-- After 1 year, papers become open access again
-
-**Current status** (as of late 2024):
-- 2023 and earlier: Should be freely accessible
-- 2024: Behind paywall until ~May 2025
-
-### ACM CCS
-- ACM Digital Library will become fully open access from **January 2026**
-- Currently, some papers available via OpenTOC
+```
+CybersecurityPaperCrawling/
+├── cybersec_papers/           # Main package
+│   ├── src/cybersec_papers/   # Source code
+│   │   ├── crawlers/          # Conference-specific crawlers
+│   │   ├── converter/         # PDF to Markdown conversion
+│   │   ├── services/          # External services (FlareSolverr, etc.)
+│   │   └── core/              # Base classes and utilities
+│   ├── convert_pdf.py         # PDF to Markdown script
+│   └── pyproject.toml
+├── {CONFERENCE}/YYYY/         # Downloaded papers (not in git)
+│   ├── papers/*.pdf
+│   ├── markdown/*/            # Converted markdown files
+│   └── metadata.csv
+└── logs/                      # Log files (not in git)
+```
 
 ## Commands
 
 ### Running Crawlers
 
 ```bash
+cd cybersec_papers
+
 # USENIX Security
-uv run python crawler_usenix_security.py -y 2023 2024
+uv run python -m cybersec_papers crawl usenix -y 2023 2024
 
 # NDSS
-uv run python crawler_ndss.py -y 2023 2024
+uv run python -m cybersec_papers crawl ndss -y 2023 2024
 
-# IEEE S&P (no auth needed for open access papers)
-uv run python crawler_ieee_sp.py -y 2023 2022 2021
+# IEEE S&P
+uv run python -m cybersec_papers crawl ieee_sp -y 2023 2022 2021
+
+# ACM CCS (requires FlareSolverr)
+# First start FlareSolverr: docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+uv run python -m cybersec_papers crawl acm_ccs -y 2023 2022 2021
 ```
 
-### Common Options (all crawlers)
+### PDF to Markdown Conversion
+
+```bash
+cd cybersec_papers
+
+# Check conversion status
+uv run python convert_pdf.py --status
+
+# Run conversion (default 6 parallel workers)
+uv run python convert_pdf.py
+
+# Custom worker count
+uv run python convert_pdf.py --workers 8
+
+# Specific conferences/years
+uv run python convert_pdf.py --conferences usenix ndss --years 2023 2024
+```
+
+### Common Options
 
 - `-y, --years`: Years to download (e.g., `-y 2021 2022 2023`)
-- `-d, --dir`: Custom save directory
+- `--workers`: Concurrent workers (default: 5 for crawlers, 6 for conversion)
 - `--delay`: Delay between requests in seconds (default: 1.0)
-- `--workers`: Concurrent download threads (default: 5)
-- `--format`: Metadata format - `csv`, `txt`, `json`, or `all` (default: `csv`)
-
-### Monitoring
-
-```bash
-./check_status.sh              # Check progress and statistics
-tail -f logs/ndss_download.log # Real-time log monitoring
-```
-
-### Background Execution
-
-```bash
-nohup uv run python crawler_ndss.py -y 2023 2024 --format csv --workers 10 > logs/ndss_download.log 2>&1 &
-```
 
 ## Architecture
 
-### Processing Pipeline
-
-```
-URL Discovery → HTML Parsing → PDF Link Extraction → Concurrent Download → Metadata Saving
-```
-
 ### Key Design Patterns
 
-- **Class-Based Scrapers**: `USENIXSecurityCrawler`, `NDSSCrawler`, `IEEESPCrawler`
-- **Thread-Safe Concurrency**: ThreadPoolExecutor with lock-based counter synchronization
-- **Retry with Exponential Backoff**: Up to 5 retries with delays (1s, 2s, up to 5s max)
-- **Content Validation**: PDF magic bytes, Content-Type headers, minimum file size checks (50KB+)
-- **Atomic File Operations**: Temp files with atomic rename to prevent partial downloads
-
-### URL Discovery Strategies
-
-Each conference has different page structures requiring custom extraction logic:
-- **NDSS**: Tries multiple URL patterns (`/ndss{year}/accepted-papers/`, `/program/`), then visits individual paper detail pages
-- **USENIX**: Multiple fallback URL patterns with both direct PDF links and presentation page inference
-- **IEEE S&P**: Uses IEEE Xplore REST API to get paper list, downloads via stamp.jsp
+- **Class-Based Scrapers**: `USENIXSecurityCrawler`, `NDSSCrawler`, `IEEESPCrawler`, `ACMCCSCrawler`
+- **Subprocess Isolation**: PDF conversion runs in isolated subprocesses for memory safety
+- **Retry with Exponential Backoff**: Up to 5 retries with delays
+- **Content Validation**: PDF magic bytes, Content-Type headers, file size checks (50KB-35MB)
 
 ### Output Structure
 
 ```
 {CONFERENCE}/YYYY/papers/*.pdf
 {CONFERENCE}/YYYY/metadata.csv
+{CONFERENCE}/YYYY/markdown/{paper_name}/auto/{paper_name}.md
 ```
 
 ## Dependencies
 
-- `requests` - HTTP client
-- `beautifulsoup4` + `lxml` - HTML parsing
-- Python >= 3.8
+Main dependencies (see `cybersec_papers/pyproject.toml`):
+- `requests`, `beautifulsoup4`, `lxml` - Web scraping
+- `mineru` - PDF to Markdown conversion (with GPU support)
+- Python >= 3.10
 - `uv` package manager
+
+## Open Access Policy Notes
+
+### IEEE S&P
+- Papers go behind paywall for 1 year after symposium
+- After 1 year, papers become open access again
+
+### ACM CCS
+- ACM Digital Library will become fully open access from January 2026
+- Currently requires FlareSolverr to bypass Cloudflare protection
